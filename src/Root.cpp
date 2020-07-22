@@ -46,13 +46,14 @@
 
 
 
-cRoot * cRoot::s_Root = nullptr;
+decltype(cRoot::s_StopEvent) cRoot::s_StopEvent;
+decltype(cRoot::s_Root)      cRoot::s_Root;
 
 
 
 
 
-cRoot::cRoot(void) :
+cRoot::cRoot() :
 	m_pDefaultWorld(nullptr),
 	m_Server(nullptr),
 	m_MonsterConfig(nullptr),
@@ -65,7 +66,6 @@ cRoot::cRoot(void) :
 {
 	Temporary::RegisterAllBlockHandlers(m_BlockTypeRegistry);
 	s_Root = this;
-	m_InputThreadRunFlag.clear();
 }
 
 
@@ -81,12 +81,18 @@ cRoot::~cRoot()
 
 
 
-void cRoot::InputThread(cRoot & a_Params)
+void cRoot::HandleInput()
 {
+	if (g_RunAsService)
+	{
+		// Ignore input when running as a service, cin was never opened in that case
+		return;
+	}
+
 	cLogCommandOutputCallback Output;
 	AString Command;
 
-	while (a_Params.m_InputThreadRunFlag.test_and_set() && std::cin.good())
+	while (g_NextState == NextState::Run)
 	{
 		#ifndef _WIN32
 			timeval Timeout{ 0, 0 };
@@ -103,9 +109,14 @@ void cRoot::InputThread(cRoot & a_Params)
 			}
 		#endif
 
-		std::getline(std::cin, Command);
+		if (!std::getline(std::cin, Command))
+		{
+			g_NextState = NextState::Stop;
+			s_StopEvent.Set();
+			return;
+		}
 
-		if (!a_Params.m_InputThreadRunFlag.test_and_set())
+		if (g_NextState != NextState::Run)
 		{
 			// Already shutting down, can't execute commands
 			break;
@@ -114,16 +125,8 @@ void cRoot::InputThread(cRoot & a_Params)
 		if (!Command.empty())
 		{
 			// Execute and clear command string when submitted
-			a_Params.ExecuteConsoleCommand(TrimString(Command), Output);
+			QueueExecuteConsoleCommand(TrimString(Command), Output);
 		}
-	}
-
-	// We have come here because the std::cin has received an EOF / a terminate signal has been sent, and the server is still running
-	// Ignore this when running as a service, cin was never opened in that case
-	if (!std::cin.good() && !m_RunAsService)
-	{
-		// Stop the server:
-		a_Params.QueueExecuteConsoleCommand("stop");
 	}
 }
 
@@ -131,25 +134,18 @@ void cRoot::InputThread(cRoot & a_Params)
 
 
 
-void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> a_OverridesRepo)
+bool cRoot::Start(cSettingsRepositoryInterface & a_OverridesRepo)
 {
-	#ifdef _WIN32
-		HMENU ConsoleMenu = GetSystemMenu(GetConsoleWindow(), FALSE);
-		EnableMenuItem(ConsoleMenu, SC_CLOSE, MF_GRAYED);  // Disable close button when starting up; it causes problems with our CTRL-CLOSE handling
-	#endif
-
-	auto consoleLogListener = MakeConsoleListener(m_RunAsService);
+	auto consoleLogListener = MakeConsoleListener(g_RunAsService);
 	auto consoleAttachment = cLogger::GetInstance().AttachListener(std::move(consoleLogListener));
 
 	cLogger::cAttachment fileAttachment;
-	if (!a_OverridesRepo->HasValue("Server","DisableLogFile"))
+	if (!a_OverridesRepo.HasValue("Server","DisableLogFile"))
 	{
 		auto fileLogListenerRet = MakeFileListener();
 		if (!fileLogListenerRet.first)
 		{
-			m_TerminateEventRaised = true;
-			LOGERROR("Failed to open log file, aborting");
-			return;
+			throw std::runtime_error("failed to open log file");
 		}
 		fileAttachment = cLogger::GetInstance().AttachListener(std::move(fileLogListenerRet.second));
 	}
@@ -172,9 +168,9 @@ void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> a_OverridesRepo)
 	LOG("Reading server config...");
 
 	m_SettingsFilename = "settings.ini";
-	if (a_OverridesRepo->HasValue("Server","ConfigFile"))
+	if (a_OverridesRepo.HasValue("Server","ConfigFile"))
 	{
-		m_SettingsFilename = a_OverridesRepo->GetValue("Server","ConfigFile");
+		m_SettingsFilename = a_OverridesRepo.GetValue("Server","ConfigFile");
 	}
 
 	auto IniFile = cpp14::make_unique<cIniFile>();
@@ -187,7 +183,7 @@ void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> a_OverridesRepo)
 		IniFile->AddHeaderComment(" Most of the settings here can be configured using the webadmin interface, if enabled in webadmin.ini");
 	}
 
-	auto settingsRepo = cpp14::make_unique<cOverridesSettingsRepository>(std::move(IniFile), std::move(a_OverridesRepo));
+	auto settingsRepo = cpp14::make_unique<cOverridesSettingsRepository>(std::move(IniFile), a_OverridesRepo);
 
 	LOG("Starting server...");
 
@@ -200,8 +196,7 @@ void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> a_OverridesRepo)
 	if (!m_Server->InitServer(*settingsRepo, ShouldAuthenticate))
 	{
 		settingsRepo->Flush();
-		LOGERROR("Failure starting server, aborting...");
-		return;
+		throw std::runtime_error("failure starting server");
 	}
 
 	m_WebAdmin = new cWebAdmin();
@@ -245,32 +240,13 @@ void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> a_OverridesRepo)
 	{
 		m_WebAdmin->Start();
 
-		LOGD("Starting InputThread...");
-		try
-		{
-			m_InputThreadRunFlag.test_and_set();
-			m_InputThread = std::thread(InputThread, std::ref(*this));
-		}
-		catch (std::system_error & a_Exception)
-		{
-			LOGERROR("cRoot::Start (std::thread) error %i: could not construct input thread; %s", a_Exception.code().value(), a_Exception.what());
-		}
-
 		LOG("Startup complete, took %ldms!", static_cast<long int>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - BeginTime).count()));
 
 		// Save the current time
 		m_StartTime = std::chrono::steady_clock::now();
 
-		#ifdef _WIN32
-			EnableMenuItem(ConsoleMenu, SC_CLOSE, MF_ENABLED);  // Re-enable close button
-		#endif
-
-		for (;;)
-		{
-			m_StopEvent.Wait();
-
-			break;
-		}
+		HandleInput();
+		s_StopEvent.Wait();
 
 		// Stop the server:
 		m_WebAdmin->Stop();
@@ -278,13 +254,6 @@ void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> a_OverridesRepo)
 		LOG("Shutting down server...");
 		m_Server->Shutdown();
 	}  // if (m_Server->Start()
-	else
-	{
-		cRoot::m_TerminateEventRaised = true;
-		#ifdef _WIN32
-			EnableMenuItem(ConsoleMenu, SC_CLOSE, MF_ENABLED);  // Re-enable close button
-		#endif
-	}
 
 	delete m_MojangAPI; m_MojangAPI = nullptr;
 
@@ -313,75 +282,49 @@ void cRoot::Start(std::unique_ptr<cSettingsRepositoryInterface> a_OverridesRepo)
 	LOG("Cleaning up...");
 	delete m_Server; m_Server = nullptr;
 
-	m_InputThreadRunFlag.clear();
-	#ifdef _WIN32
-		DWORD Length;
-		INPUT_RECORD Record
-		{
-			KEY_EVENT,
-			{
-				{
-					TRUE,
-					1,
-					VK_RETURN,
-					static_cast<WORD>(MapVirtualKey(VK_RETURN, MAPVK_VK_TO_VSC)),
-					{ { VK_RETURN } },
-					0
-				}
-			}
-		};
-
-		// Can't kill the input thread since it breaks cin (getline doesn't block / receive input on restart)
-		// Apparently no way to unblock getline
-		// Only thing I can think of for now
-		if (WriteConsoleInput(GetStdHandle(STD_INPUT_HANDLE), &Record, 1, &Length) == 0)
-		{
-			LOGWARN("Couldn't notify the input thread; the server will hang before shutdown!");
-			m_TerminateEventRaised = true;
-			m_InputThread.detach();
-		}
-		else
-		{
-			m_InputThread.join();
-		}
-	#else
-		m_InputThread.join();
-	#endif
-
-	if (m_TerminateEventRaised)
-	{
-		LOG("Shutdown successful!");
-	}
-	else
-	{
-		LOG("Shutdown successful - restarting...");
-	}
+	LOG("Shutdown successful!");
 	LOG("--- Stopped Log ---");
+
+	return g_NextState == NextState::Restart;
 }
 
 
 
 
 
-void cRoot::StopServer()
+void cRoot::Stop(NextState a_NextState)
 {
-	// Kick all players from the server with custom disconnect message
+	ASSERT(a_NextState != NextState::Run);
+	g_NextState = a_NextState;
+	s_StopEvent.Set();
 
-	bool SentDisconnect = false;
-	cRoot::Get()->ForEachPlayer([&](cPlayer & a_Player)
-		{
-			a_Player.GetClientHandlePtr()->Kick(m_Server->GetShutdownMessage());
-			SentDisconnect = true;
-			return false;
-		}
-	);
-	if (SentDisconnect)
+#ifdef WIN32
+	if (g_RunAsService)
 	{
-		std::this_thread::sleep_for(std::chrono::seconds(1));
+		return;
 	}
-	m_TerminateEventRaised = true;
-	m_StopEvent.Set();
-	m_InputThreadRunFlag.clear();
+
+	DWORD Length;
+	INPUT_RECORD Record
+	{
+		KEY_EVENT,
+		{
+			{
+				TRUE,
+				1,
+				VK_RETURN,
+				static_cast<WORD>(MapVirtualKey(VK_RETURN, MAPVK_VK_TO_VSC)),
+				{ { VK_RETURN } },
+				0
+			}
+		}
+	};
+
+	// Can't kill the input thread since it breaks cin (getline doesn't block / receive input on restart)
+	// Apparently no way to unblock getline apart from CancelIoEx, but xoft wants Windows XP support
+	// Only thing I can think of for now. Note we ignore the return value; if we're Run as a service it returns failure
+	VERIFY(WriteConsoleInput(GetStdHandle(STD_INPUT_HANDLE), &Record, 1, &Length) == TRUE);
+#endif
 }
 
 
@@ -607,29 +550,44 @@ bool cRoot::ForEachWorld(cWorldListCallback a_Callback)
 
 
 
-void cRoot::TickCommands(void)
-{
-	// Execute any pending commands:
-	cCommandQueue PendingCommands;
-	{
-		cCSLock Lock(m_CSPendingCommands);
-		std::swap(PendingCommands, m_PendingCommands);
-	}
-	for (cCommandQueue::iterator itr = PendingCommands.begin(), end = PendingCommands.end(); itr != end; ++itr)
-	{
-		ExecuteConsoleCommand(itr->m_Command, *(itr->m_Output));
-	}
-}
-
-
-
-
-
 void cRoot::QueueExecuteConsoleCommand(const AString & a_Cmd, cCommandOutputCallback & a_Output)
 {
-	// Put the command into a queue (Alleviates FS #363):
-	cCSLock Lock(m_CSPendingCommands);
-	m_PendingCommands.emplace_back(a_Cmd, &a_Output);
+	const auto KickPlayers = [this]
+	{
+		// Kick all players from the server with custom disconnect message
+
+		bool SentDisconnect = false;
+		cRoot::Get()->ForEachPlayer(
+			[&](cPlayer & a_Player)
+			{
+				a_Player.GetClientHandlePtr()->Kick(m_Server->GetShutdownMessage());
+				SentDisconnect = true;
+				return false;
+			}
+		);
+
+		if (SentDisconnect)
+		{
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+		}
+	};
+
+	// Some commands are built-in:
+	if (a_Cmd == "stop")
+	{
+		KickPlayers();
+		Stop(NextState::Stop);
+		return;
+	}
+	else if (a_Cmd == "restart")
+	{
+		KickPlayers();
+		Stop(NextState::Restart);
+		return;
+	}
+
+	LOG("Executing console command: \"%s\"", a_Cmd.c_str());
+	m_Server->ExecuteConsoleCommand(a_Cmd, a_Output);
 }
 
 
@@ -639,31 +597,7 @@ void cRoot::QueueExecuteConsoleCommand(const AString & a_Cmd, cCommandOutputCall
 void cRoot::QueueExecuteConsoleCommand(const AString & a_Cmd)
 {
 	// Put the command into a queue (Alleviates FS #363):
-	cCSLock Lock(m_CSPendingCommands);
-	m_PendingCommands.push_back(cCommand(a_Cmd, new cLogCommandDeleteSelfOutputCallback));
-}
-
-
-
-
-
-void cRoot::ExecuteConsoleCommand(const AString & a_Cmd, cCommandOutputCallback & a_Output)
-{
-	// Some commands are built-in:
-	if (a_Cmd == "stop")
-	{
-		StopServer();
-		return;
-	}
-	else if (a_Cmd == "restart")
-	{
-		m_StopEvent.Set();
-		m_InputThreadRunFlag.clear();
-		return;
-	}
-
-	LOG("Executing console command: \"%s\"", a_Cmd.c_str());
-	m_Server->ExecuteConsoleCommand(a_Cmd, a_Output);
+	QueueExecuteConsoleCommand(a_Cmd, *new cLogCommandDeleteSelfOutputCallback);
 }
 
 
